@@ -55,7 +55,7 @@ def scalar_output(network, x):
 
 
 def exact_interval_check(network, bound):
-    """Extrema are among endpoints and ReLU roots for this one-hidden-layer net."""
+    """Enumerate all candidate extrema for this topology; evaluate in float64."""
     p = parameters(network)
     roots = []
     for weight, bias in zip(p["first_weight"], p["first_bias"]):
@@ -85,6 +85,7 @@ def repair(bound, mode):
     network = get_dnn().to(dtype=torch.float64)
     original_shapes = [tuple(p.shape) for p in network.parameters()]
     solver = st.GurobiSolver().verbose_(False)
+    solver.solver.Params.Threads = 1
     network.to(solver).repair()
     network.requires_symbolic_weight_and_bias()
     points = torch.tensor([[LOW], [HIGH]], dtype=torch.float64)
@@ -94,7 +95,10 @@ def repair(bound, mode):
         reference_points = torch.tensor([[REFERENCE], [REFERENCE]], dtype=torch.float64)
         shared_pattern = network.activation_pattern(reference_points)
         symbolic = network(points, pattern=shared_pattern)
-    feasible = solver.solve(-bound <= symbolic, symbolic <= bound, minimize=network.delta(points))
+    # Reuse this forward pass: delta(points) alone would encode an additional
+    # forward with the original pointwise patterns, constraining interval repair.
+    objective_expression = network.delta(points, sym_output=symbolic)
+    feasible = solver.solve(-bound <= symbolic, symbolic <= bound, minimize=objective_expression)
     if not feasible:
         raise AssertionError("Repair unexpectedly infeasible: " + mode + " " + str(bound))
     objective = float(solver.solver.ObjVal)
@@ -110,6 +114,10 @@ def repair(bound, mode):
         "bound": bound,
         "solver_feasible": feasible,
         "solver_objective": objective,
+        "solver_status": solver.solver.Status,
+        "solver_threads": solver.solver.Params.Threads,
+        "solver_variables": solver.solver.NumVars,
+        "solver_constraints": solver.solver.NumConstrs,
         "endpoint_outputs": endpoints,
         "parameters": parameters(network),
         "exact_interval_check": interval,
@@ -123,6 +131,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    torch.set_num_threads(1)
     commit = check_checkout()
     baseline = get_dnn().to(dtype=torch.float64).eval()
     result = {
@@ -130,7 +139,9 @@ def main():
         "environment": {"torch": torch.__version__, "gurobi": ".".join(map(str, __import__("gurobipy").gurobi.version()))},
         "interval": [LOW, HIGH],
         "reference_for_shared_pattern": REFERENCE,
-        "baseline": exact_interval_check(baseline, 0.1),
+        "objective": "output-delta norm plus parameter-delta norm; each norm is Linf plus normalized L1",
+        "verification_scope": "Complete extrema enumeration for this 1-D, one-hidden-layer topology, evaluated in float64 with tolerance 1e-7; not an exact-arithmetic certificate or a verifier for general DNNs",
+        "baseline": {**exact_interval_check(baseline, 0.1), "parameters": parameters(baseline)},
         "runs": [repair(bound, mode) for bound in (0.1, 0.02) for mode in ("pointwise", "shared_pattern")],
     }
     args.output.write_text(json.dumps(result, indent=2) + "\n")
